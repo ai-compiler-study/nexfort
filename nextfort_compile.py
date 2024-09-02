@@ -1,12 +1,14 @@
 # %%
 import os
-from onediffx import compile_pipe
-from onediff.utils.import_utils import is_nexfort_available
 
 import torch
+import torch._inductor.config as inductor_config
+from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
+from onediffx import compile_pipe
 from torch.utils.flop_counter import FlopCounterMode
 from triton.testing import do_bench
-from diffusers.pipelines.flux.pipeline_flux import FluxPipeline
+
+from onediff.utils.import_utils import is_nexfort_available
 
 torch.set_default_device('cuda')
 # RuntimeError: RuntimeError: Unsupported timesteps dtype: c10::BFloat16
@@ -14,7 +16,14 @@ torch.set_default_device('cuda')
 os.environ['NEXFORT_FUSE_TIMESTEP_EMBEDDING'] = '0'
 os.environ['NEXFORT_FX_FORCE_TRITON_SDPA'] = '1'
 # %%
-model_id: str = "black-forest-labs/FLUX.1-schnell"
+"""
+    While using FLUX dev, is mandatory to provide the HF_TOKEN environment variable.
+"""
+# os.environ["HF_TOKEN"] = ""
+
+model_id: str = "black-forest-labs/FLUX.1-dev" # "black-forest-labs/FLUX.1-schnell"
+inductor_native = True
+diffusion_steps = 20
 
 pipe = FluxPipeline.from_pretrained(model_id, 
                                     torch_dtype=torch.bfloat16, 
@@ -57,6 +66,14 @@ compiler_modes = collections.OrderedDict(
 if is_nexfort_available():
     options = '{"mode": "max-optimize:max-autotune:benchmark:low-precision:freezing:cudagraphs"}'
     pipe = compile_pipe(pipe, backend="nexfort", options=options, fuse_qkv_projections=True)
+if inductor_native:
+    inductor_config.max_autotune_gemm_backends = "CUTLASS"
+    inductor_config.max_autotune_gemm_search_space = "EXHAUSTIVE"
+
+    pipe.vae = torch.compile(pipe.vae)
+    pipe.text_encoder = torch.compile(pipe.text_encoder)
+    pipe.text_encoder_2 = torch.compile(pipe.text_encoder_2)
+    pipe.transformer = torch.compile(pipe.transformer)
 # %%
 import time  # noqa: E402
 
@@ -65,7 +82,7 @@ st = time.time()
 image = pipe(
     prompt,
     guidance_scale=0.0,
-    num_inference_steps=4,
+    num_inference_steps=diffusion_steps,
     max_sequence_length=256,
     generator=torch.Generator("cpu").manual_seed(0)
 ).images[0]
@@ -87,7 +104,7 @@ def get_flops_achieved(f):
 get_flops_achieved(lambda: pipe(
                 "A tree in the forest",
                 guidance_scale=0.0,
-                num_inference_steps=4,
+                num_inference_steps=diffusion_steps,
                 max_sequence_length=256,
                 generator=torch.Generator("cpu").manual_seed(0)
 ))
@@ -107,11 +124,11 @@ def benchmark_nexfort_function(iters, f, *args, **kwargs):
     # but returns milliseconds, so we need to multiply it to increase resolution
     return start_event.elapsed_time(end_event) * 1000 / iters, *f(*args, **kwargs)
 # %%
-time_nextfort_flux_fwd, _ = benchmark_nexfort_function(10,
+time_nextfort_flux_fwd, _ = benchmark_nexfort_function(100,
                                                     pipe,
                                                     "A tree in the forest",
                                                     guidance_scale=0.0,
-                                                    num_inference_steps=4,
+                                                    num_inference_steps=diffusion_steps,
                                                     max_sequence_length=256,
                                                     )
 print(f"avg fwd time: {time_nextfort_flux_fwd / 1e6} s")
