@@ -10,24 +10,26 @@ from triton.testing import do_bench
 
 from onediff.utils.import_utils import is_nexfort_available
 
-torch.set_default_device('cuda')
+torch.set_default_device("cuda")
 # RuntimeError: RuntimeError: Unsupported timesteps dtype: c10::BFloat16
 # ref: https://github.com/siliconflow/onediff/issues/1066#issuecomment-2271523799
-os.environ['NEXFORT_FUSE_TIMESTEP_EMBEDDING'] = '0'
-os.environ['NEXFORT_FX_FORCE_TRITON_SDPA'] = '1'
+os.environ["NEXFORT_FUSE_TIMESTEP_EMBEDDING"] = "0"
+os.environ["NEXFORT_FX_FORCE_TRITON_SDPA"] = "1"
 # %%
 """
     While using FLUX dev, is mandatory to provide the HF_TOKEN environment variable.
 """
 # os.environ["HF_TOKEN"] = ""
 
-model_id: str = "black-forest-labs/FLUX.1-dev" # "black-forest-labs/FLUX.1-schnell"
+model_id: str = "black-forest-labs/FLUX.1-dev"  # "black-forest-labs/FLUX.1-schnell"
 inductor_native = True
+use_nexfort = False
 diffusion_steps = 20
-
-pipe = FluxPipeline.from_pretrained(model_id, 
-                                    torch_dtype=torch.bfloat16, 
-                                    )
+# %%
+pipe = FluxPipeline.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+)
 pipe.to("cuda")
 # %%
 """
@@ -63,12 +65,16 @@ compiler_modes = collections.OrderedDict(
     }
     )
 """
-if is_nexfort_available():
+if is_nexfort_available() and use_nexfort:
     options = '{"mode": "max-optimize:max-autotune:benchmark:low-precision:freezing:cudagraphs"}'
-    pipe = compile_pipe(pipe, backend="nexfort", options=options, fuse_qkv_projections=True)
+    pipe = compile_pipe(
+        pipe, backend="nexfort", options=options, fuse_qkv_projections=True
+    )
 if inductor_native:
-    inductor_config.max_autotune_gemm_backends = "CUTLASS"
+    inductor_config.max_autotune_gemm_backends = "Triton"
     inductor_config.max_autotune_gemm_search_space = "EXHAUSTIVE"
+    inductor_config.cuda.compile_opt_level = "-O3"  # default: "-O1"
+    inductor_config.cuda.use_fast_math = True
 
     pipe.vae = torch.compile(pipe.vae)
     pipe.text_encoder = torch.compile(pipe.text_encoder)
@@ -79,35 +85,38 @@ import time  # noqa: E402
 
 prompt = "A cat holding a sign that says hello world"
 st = time.time()
-image = pipe(
-    prompt,
-    guidance_scale=0.0,
-    num_inference_steps=diffusion_steps,
-    max_sequence_length=256,
-    generator=torch.Generator("cpu").manual_seed(0)
-).images[0]
-torch.cuda.synchronize()
+with torch.inference_mode():
+    image = pipe(
+        prompt,
+        guidance_scale=0.0,
+        num_inference_steps=diffusion_steps,
+        max_sequence_length=256,
+        generator=torch.Generator("cpu").manual_seed(0),
+    ).images[0]
+    torch.cuda.synchronize()
 et_fwd = time.time() - st
 print(f"Time taken for forward pass: {et_fwd:.6f} s")
 image.save("flux-schnell.png")
 # %%
 def get_flops_achieved(f):
-    flop_counter = FlopCounterMode(display=False)
+    flop_counter = FlopCounterMode(display=True)
     with flop_counter:
         f()
     total_flops = flop_counter.get_total_flops()
     ms_per_iter = do_bench(f)
-    iters_per_second = 1e3/ms_per_iter
+    iters_per_second = 1e3 / ms_per_iter
     print(f"{iters_per_second * total_flops / 1e12} TF/s")
 
 
-get_flops_achieved(lambda: pipe(
-                "A tree in the forest",
-                guidance_scale=0.0,
-                num_inference_steps=diffusion_steps,
-                max_sequence_length=256,
-                generator=torch.Generator("cpu").manual_seed(0)
-))
+get_flops_achieved(
+    lambda: pipe(
+        "A tree in the forest",
+        guidance_scale=0.0,
+        num_inference_steps=diffusion_steps,
+        max_sequence_length=256,
+        generator=torch.Generator("cpu").manual_seed(0),
+    )
+)
 # %%
 def benchmark_nexfort_function(iters, f, *args, **kwargs):
     f(*args, **kwargs)
@@ -124,12 +133,13 @@ def benchmark_nexfort_function(iters, f, *args, **kwargs):
     # but returns milliseconds, so we need to multiply it to increase resolution
     return start_event.elapsed_time(end_event) * 1000 / iters, *f(*args, **kwargs)
 # %%
-time_nextfort_flux_fwd, _ = benchmark_nexfort_function(100,
-                                                    pipe,
-                                                    "A tree in the forest",
-                                                    guidance_scale=0.0,
-                                                    num_inference_steps=diffusion_steps,
-                                                    max_sequence_length=256,
-                                                    )
+time_nextfort_flux_fwd, _ = benchmark_nexfort_function(
+    10,
+    pipe,
+    "A tree in the forest",
+    guidance_scale=0.0,
+    num_inference_steps=diffusion_steps,
+    max_sequence_length=256,
+)
 print(f"avg fwd time: {time_nextfort_flux_fwd / 1e6} s")
 # %%
