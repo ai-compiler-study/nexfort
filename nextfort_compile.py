@@ -15,6 +15,7 @@ torch.set_default_device("cuda")
 # ref: https://github.com/siliconflow/onediff/issues/1066#issuecomment-2271523799
 os.environ["NEXFORT_FUSE_TIMESTEP_EMBEDDING"] = "0"
 os.environ["NEXFORT_FX_FORCE_TRITON_SDPA"] = "1"
+# os.environ["NEXFORT_GRAPH_CACHE"] = "1" # broken
 # %%
 """
     While using FLUX dev, is mandatory to provide the HF_TOKEN environment variable.
@@ -22,9 +23,10 @@ os.environ["NEXFORT_FX_FORCE_TRITON_SDPA"] = "1"
 # os.environ["HF_TOKEN"] = ""
 
 model_id: str = "black-forest-labs/FLUX.1-dev"  # "black-forest-labs/FLUX.1-schnell"
-inductor_native = True
-use_nexfort = False
-diffusion_steps = 20
+inductor_native = False
+use_nexfort = True
+diffusion_steps = 30
+max_sequence_length = 512
 # %%
 pipe = FluxPipeline.from_pretrained(
     model_id,
@@ -66,6 +68,7 @@ compiler_modes = collections.OrderedDict(
     )
 """
 if is_nexfort_available() and use_nexfort:
+    # options = '{"mode": "O3"}' 
     options = '{"mode": "max-optimize:max-autotune:benchmark:low-precision:freezing:cudagraphs"}'
     pipe = compile_pipe(
         pipe, backend="nexfort", options=options, fuse_qkv_projections=True
@@ -90,33 +93,13 @@ with torch.inference_mode():
         prompt,
         guidance_scale=0.0,
         num_inference_steps=diffusion_steps,
-        max_sequence_length=256,
+        max_sequence_length=max_sequence_length,
         generator=torch.Generator("cpu").manual_seed(0),
     ).images[0]
     torch.cuda.synchronize()
 et_fwd = time.time() - st
 print(f"Time taken for forward pass: {et_fwd:.6f} s")
 image.save("flux-schnell.png")
-# %%
-def get_flops_achieved(f):
-    flop_counter = FlopCounterMode(display=True)
-    with flop_counter:
-        f()
-    total_flops = flop_counter.get_total_flops()
-    ms_per_iter = do_bench(f)
-    iters_per_second = 1e3 / ms_per_iter
-    print(f"{iters_per_second * total_flops / 1e12} TF/s")
-
-
-get_flops_achieved(
-    lambda: pipe(
-        "A tree in the forest",
-        guidance_scale=0.0,
-        num_inference_steps=diffusion_steps,
-        max_sequence_length=256,
-        generator=torch.Generator("cpu").manual_seed(0),
-    )
-)
 # %%
 def benchmark_nexfort_function(iters, f, *args, **kwargs):
     f(*args, **kwargs)
@@ -139,7 +122,7 @@ time_nextfort_flux_fwd, _ = benchmark_nexfort_function(
     "A tree in the forest",
     guidance_scale=0.0,
     num_inference_steps=diffusion_steps,
-    max_sequence_length=256,
+    max_sequence_length=max_sequence_length,
 )
 print(f"avg fwd time: {time_nextfort_flux_fwd / 1e6} s")
 # %%
